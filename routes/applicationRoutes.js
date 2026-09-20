@@ -1,5 +1,6 @@
 const express = require("express");
 const router = express.Router();
+const authMiddleware = require("../middleware/auth");
 const {
   createApplication,
   getApplications,
@@ -13,9 +14,12 @@ const {
   updateCoverLetter,
   deleteApplication,
   getStats,
+  autoApplyJobs,
 } = require("../controllers/applicationController");
 
+router.use(authMiddleware);
 router.get("/stats", getStats);
+router.post("/auto-apply", autoApplyJobs);
 router.post("/", createApplication);
 router.get("/", getApplications);
 router.get("/:id", getApplication);

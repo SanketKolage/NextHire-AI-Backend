@@ -1,4 +1,9 @@
 const { GoogleGenAI } = require("@google/genai");
+const { buildJobMatchAnalysis } = require("./job/jobMatcher.service");
+const { analyzeJobDescription } = require("./ai/jdAnalyzer.service");
+const { buildTailoredResume } = require("./ai/resumeTailor.service");
+const { buildCoverLetterText } = require("./ai/coverLetter.service");
+const { buildAnswer, isPersonalOrLegalQuestion } = require("./ai/applicationAnswer.service");
 
 const ai = new GoogleGenAI({
   apiKey: process.env.GEMINI_API_KEY,
@@ -35,7 +40,65 @@ async function generateJSON(prompt, retries = 3) {
     throw err;
   }
 }
+async function generateTailoredResume(
+  resumeParsed,
+  jobDetails
+) {
+  const fallback = buildTailoredResume(resumeParsed, jobDetails);
 
+  const prompt = `
+You are an ATS optimization expert.
+
+Rewrite the resume to maximize ATS score.
+
+Rules:
+- Never invent skills or experience.
+- Never invent projects or certifications.
+- Only use information present in the candidate profile and job description.
+- Reorder skills based on JD relevance.
+- Rewrite summary and bullets for ATS clarity.
+- Return ONLY valid JSON.
+
+{
+  "summary": "",
+  "skills": [],
+  "experience": [],
+  "projects": [],
+  "atsScore": 0,
+  "matchAnalysis": {
+    "summary": "",
+    "suggestedSummary": "",
+    "relevantSkills": [],
+    "relevantExperienceBullets": [],
+    "relevantProjects": [],
+    "missingRequirements": [],
+    "atsRecommendations": []
+  }
+}
+
+Resume:
+${JSON.stringify(resumeParsed)}
+
+Job:
+${JSON.stringify(jobDetails)}
+`;
+
+  try {
+    const aiResult = await generateJSON(prompt);
+    return {
+      ...fallback,
+      ...aiResult,
+      summary: aiResult.summary || fallback.summary,
+      skills: Array.isArray(aiResult.skills) && aiResult.skills.length ? aiResult.skills : fallback.skills,
+      experience: Array.isArray(aiResult.experience) && aiResult.experience.length ? aiResult.experience : fallback.experience,
+      projects: Array.isArray(aiResult.projects) && aiResult.projects.length ? aiResult.projects : fallback.projects,
+      atsScore: typeof aiResult.atsScore === "number" ? aiResult.atsScore : 85,
+      matchAnalysis: aiResult.matchAnalysis || fallback.matchAnalysis,
+    };
+  } catch (error) {
+    return fallback;
+  }
+}
 // ─────────────────────────────────────────────────────────────
 // Generic Text Generator
 // ─────────────────────────────────────────────────────────────
@@ -105,19 +168,27 @@ ${rawText}
 // 2. Score Job Match
 // ─────────────────────────────────────────────────────────────
 async function scoreJobMatch(resumeParsed, jobDetails) {
-  const prompt = `
+  const fallbackMatch = buildJobMatchAnalysis(resumeParsed, jobDetails);
+
+  try {
+    const prompt = `
 You are an ATS and recruiter expert.
 
 Evaluate how well the candidate matches the job.
 
-Return ONLY valid JSON.
+Rules:
+- Only use real evidence from the candidate profile and job data.
+- Do not invent skills, experience, or education.
+- Return ONLY valid JSON.
+- Keep explanations truthful.
 
 {
   "score": 0,
   "strengths": [],
   "gaps": [],
   "recommendation": "",
-  "shouldApply": true
+  "shouldApply": true,
+  "explanation": ""
 }
 
 Candidate:
@@ -127,22 +198,46 @@ Job:
 ${JSON.stringify(jobDetails, null, 2)}
 `;
 
-  return await generateJSON(prompt);
+    const aiResult = await generateJSON(prompt);
+    return {
+      ...fallbackMatch,
+      ...aiResult,
+      score: typeof aiResult.score === "number" ? aiResult.score : fallbackMatch.score,
+      strengths: Array.isArray(aiResult.strengths) && aiResult.strengths.length ? aiResult.strengths : fallbackMatch.strengths,
+      gaps: Array.isArray(aiResult.gaps) && aiResult.gaps.length ? aiResult.gaps : fallbackMatch.gaps,
+      recommendation: aiResult.recommendation || fallbackMatch.recommendation,
+      shouldApply: typeof aiResult.shouldApply === "boolean" ? aiResult.shouldApply : fallbackMatch.shouldApply,
+      explanation: aiResult.explanation || fallbackMatch.explanation,
+      overallMatchScore: typeof aiResult.score === "number" ? aiResult.score : fallbackMatch.overallMatchScore,
+      skillMatchScore: fallbackMatch.skillMatchScore,
+      experienceMatchScore: fallbackMatch.experienceMatchScore,
+      locationMatchScore: fallbackMatch.locationMatchScore,
+      titleMatchScore: fallbackMatch.titleMatchScore,
+      educationMatchScore: fallbackMatch.educationMatchScore,
+      preferenceMatchScore: fallbackMatch.preferenceMatchScore,
+    };
+  } catch (error) {
+    return fallbackMatch;
+  }
 }
 
 // ─────────────────────────────────────────────────────────────
 // 3. Cover Letter
 // ─────────────────────────────────────────────────────────────
-async function generateCoverLetter(resumeParsed, jobDetails) {
+async function generateCoverLetter(resumeParsed, jobDetails, options = {}) {
+  const tone = options.tone || "Professional";
+  const fallback = buildCoverLetterText(resumeParsed, jobDetails, tone);
+
   const prompt = `
-Write a professional cover letter.
+Write a concise, truthful cover letter.
 
 Requirements:
 - 3 to 4 paragraphs
-- Professional tone
-- Tailored to the job
-- Show relevant experience
-- End with a call to action
+- Tone: ${tone}
+- Mention the company and role
+- Only use facts from the candidate profile and job description
+- Do not invent experience, projects, or certifications
+- End with a clear call to action
 - No markdown
 
 Candidate:
@@ -152,7 +247,13 @@ Job:
 ${JSON.stringify(jobDetails, null, 2)}
 `;
 
-  return await generateText(prompt);
+  try {
+    const generated = await generateText(prompt);
+    if (generated && generated.length > 20) return generated;
+    return fallback;
+  } catch (error) {
+    return fallback;
+  }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -162,6 +263,9 @@ async function generateTailoringSuggestions(
   resumeParsed,
   jobDetails
 ) {
+  const fallback = buildTailoredResume(resumeParsed, jobDetails);
+  const jdAnalysis = analyzeJobDescription(resumeParsed, jobDetails);
+
   const prompt = `
 You are an ATS optimization expert.
 
@@ -172,7 +276,16 @@ Return ONLY valid JSON.
   "keywordsToAdd": [],
   "keywordsPresent": [],
   "atsScore": 0,
-  "priorityActions": []
+  "priorityActions": [],
+  "matchAnalysis": {
+    "summary": "",
+    "suggestedSummary": "",
+    "relevantSkills": [],
+    "relevantExperienceBullets": [],
+    "relevantProjects": [],
+    "missingRequirements": [],
+    "atsRecommendations": []
+  }
 }
 
 Candidate:
@@ -182,7 +295,41 @@ Job:
 ${JSON.stringify(jobDetails, null, 2)}
 `;
 
-  return await generateJSON(prompt);
+  try {
+    const aiResult = await generateJSON(prompt);
+    return {
+      ...fallback,
+      ...aiResult,
+      suggestions: Array.isArray(aiResult.suggestions) && aiResult.suggestions.length ? aiResult.suggestions : [
+        `Emphasize ${jdAnalysis.requiredSkills.slice(0, 4).join(", ") || "core role skills"} in the summary and experience section.`,
+        `Use the exact job keywords where they align with your real experience.`,
+      ],
+      keywordsToAdd: Array.isArray(aiResult.keywordsToAdd) && aiResult.keywordsToAdd.length ? aiResult.keywordsToAdd : jdAnalysis.missingRequirements.slice(0, 5),
+      keywordsPresent: Array.isArray(aiResult.keywordsPresent) && aiResult.keywordsPresent.length ? aiResult.keywordsPresent : jdAnalysis.keywordsPresent.slice(0, 5),
+      atsScore: typeof aiResult.atsScore === "number" ? aiResult.atsScore : 85,
+      priorityActions: Array.isArray(aiResult.priorityActions) && aiResult.priorityActions.length ? aiResult.priorityActions : [
+        "Rewrite the summary using the JD keywords that match your background.",
+        "Highlight the most relevant technologies in the skills and experience section.",
+      ],
+      matchAnalysis: aiResult.matchAnalysis || fallback.matchAnalysis,
+    };
+  } catch (error) {
+    return {
+      ...fallback,
+      suggestions: [
+        `Emphasize ${jdAnalysis.requiredSkills.slice(0, 4).join(", ") || "core role skills"} in the summary and experience section.`,
+        `Use the exact job keywords where they align with your real experience.`,
+      ],
+      keywordsToAdd: jdAnalysis.missingRequirements.slice(0, 5),
+      keywordsPresent: jdAnalysis.keywordsPresent.slice(0, 5),
+      atsScore: 85,
+      priorityActions: [
+        "Rewrite the summary using the JD keywords that match your background.",
+        "Highlight the most relevant technologies in the skills and experience section.",
+      ],
+      matchAnalysis: fallback.matchAnalysis,
+    };
+  }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -255,6 +402,21 @@ async function batchScoreJobs(resumeParsed, jobs) {
 // ─────────────────────────────────────────────────────────────
 // Exports
 // ─────────────────────────────────────────────────────────────
+async function generateApplicationAnswers(resumeParsed, questions = []) {
+  if (!Array.isArray(questions) || !questions.length) {
+    return [];
+  }
+
+  return questions.map((question) => {
+    const answer = buildAnswer(resumeParsed, question);
+    return {
+      question,
+      answer: answer.answer,
+      requiresUserInput: answer.requiresUserInput || isPersonalOrLegalQuestion(question),
+    };
+  });
+}
+
 module.exports = {
   parseResume,
   scoreJobMatch,
@@ -262,4 +424,6 @@ module.exports = {
   generateTailoringSuggestions,
   generateApplicationEmail,
   batchScoreJobs,
+  generateTailoredResume,
+  generateApplicationAnswers,
 };

@@ -4,6 +4,52 @@ const Resume = require("../models/Resume");
 const aiService = require("../services/aiService");
 const emailService = require("../services/emailService");
 
+const AUTO_APPLY_STATUS_VALUES = [
+  "new",
+  "pending",
+  "applying",
+  "tailored",
+  "ready",
+  "applied",
+  "failed",
+  "manual_action_required",
+  "rejected",
+  "withdrawn",
+];
+
+const STATUS_VALUES = [
+  "pending",
+  "tailored",
+  "ready",
+  "applied",
+  "viewed",
+  "interviewing",
+  "offer",
+  "approved",
+  "rejected",
+  "withdrawn",
+];
+
+function normalizeStatus(status) {
+  if (!status) return "new";
+
+  const normalized = String(status).trim().toLowerCase();
+  const mapping = {
+    draft: "new",
+    failed: "failed",
+    success: "applied",
+    "manual action required": "manual_action_required",
+    "manual-action-required": "manual_action_required",
+    applying: "applying",
+  };
+
+  if (STATUS_VALUES.includes(normalized)) return normalized;
+  if (AUTO_APPLY_STATUS_VALUES.includes(normalized)) return normalized;
+  if (mapping[normalized]) return mapping[normalized];
+
+  return "new";
+}
+
 // ── POST /api/applications ─────────────────────────────────────────────────────
 exports.createApplication = async (req, res) => {
   try {
@@ -14,10 +60,82 @@ exports.createApplication = async (req, res) => {
       return res.status(409).json({ success: false, message: "Application already exists", application: existing });
     }
 
-    const application = new Application({ resumeId, jobId, priority: priority || "medium" });
+    const application = new Application({ resumeId, jobId, priority: priority || "medium", status: "new" });
     await application.save();
 
     res.status(201).json({ success: true, application });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+exports.autoApplyJobs = async (req, res) => {
+  try {
+    const { resumeId, jobIds = [] } = req.body;
+
+    if (!resumeId) {
+      return res.status(400).json({ success: false, message: "Resume is required for auto apply." });
+    }
+
+    const resume = await Resume.findById(resumeId);
+    if (!resume?.parsed) {
+      return res.status(400).json({ success: false, message: "Resume not parsed or missing." });
+    }
+
+    const results = [];
+    for (const jobId of jobIds) {
+      const job = await Job.findById(jobId);
+      if (!job) {
+        results.push({ jobId, status: "failed", message: "Job not found" });
+        continue;
+      }
+
+      const existing = await Application.findOne({ resumeId, jobId });
+      if (existing) {
+        results.push({ jobId, status: existing.status || "new" });
+        continue;
+      }
+
+      const app = new Application({
+        resumeId,
+        jobId,
+        status: "applying",
+        autoApplyEligible: !!job.applyUrl,
+        notes: "Auto Apply started",
+      });
+
+      const hasDirectApply = !!job.applyUrl && /^https?:\/\//i.test(job.applyUrl);
+      const blockedByManualCheck = !hasDirectApply || /captcha|otp|login|verify|manual/i.test(`${job.title} ${job.company} ${job.description || ""}`);
+
+      app.status = blockedByManualCheck ? "manual_action_required" : "applying";
+      app.notes = blockedByManualCheck
+        ? "Manual Action Required: direct apply link blocked or login/verification required."
+        : "Auto Apply initiated; submission requires live external confirmation";
+
+      await app.save();
+
+      if (blockedByManualCheck) {
+        results.push({ jobId, status: "manual_action_required", message: app.notes });
+        continue;
+      }
+
+      const confirmed = false;
+      if (confirmed) {
+        app.status = "applied";
+        app.appliedAt = new Date();
+        app.appliedVia = "auto";
+        app.applicationUrl = job.applyUrl;
+        await app.save();
+        results.push({ jobId, status: "applied" });
+      } else {
+        app.status = "failed";
+        app.notes = "Submission was not confirmed by the external job system.";
+        await app.save();
+        results.push({ jobId, status: "failed", message: "Submission not confirmed; manual review required." });
+      }
+    }
+
+    return res.json({ success: true, results });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -59,14 +177,49 @@ exports.getApplication = async (req, res) => {
 exports.updateStatus = async (req, res) => {
   try {
     const { status, notes } = req.body;
-    const update = { status };
+    const normalizedStatus = normalizeStatus(status);
+    const update = { status: normalizedStatus };
     if (notes) update.notes = notes;
-    if (status === "applied") update.appliedAt = new Date();
+    if (normalizedStatus === "applied" && !req.body.appliedAt) update.appliedAt = new Date();
+    if (normalizedStatus === "approved") update.approvedAt = new Date();
 
     const application = await Application.findByIdAndUpdate(req.params.id, update, { new: true });
     res.json({ success: true, application });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+exports.generateTailoredResume = async (req, res) => {
+  try {
+    const application = await Application.findById(req.params.id)
+      .populate("resumeId")
+      .populate("jobId");
+
+    if (!application) return res.status(404).json({ success: false, message: "Not found" });
+
+    const tailored = await aiService.generateTailoredResume(
+      application.resumeId.parsed,
+      application.jobId
+    );
+
+    application.status = "tailored";
+    application.tailoredResume = {
+      ...tailored,
+      generatedAt: new Date(),
+    };
+
+    await application.save();
+
+    res.json({
+      success: true,
+      tailoredResume: application.tailoredResume,
+    });
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      message: err.message,
+    });
   }
 };
 
@@ -151,6 +304,9 @@ exports.sendEmail = async (req, res) => {
     application.appliedAt = new Date();
     application.appliedVia = "email";
     application.applicationUrl = `mailto:${to}`;
+    if (application.resumeId?.filePath) {
+      application.resumePdf = application.resumeId.filePath;
+    }
     await application.save();
 
     res.json({ success: true, message: "Application email sent successfully" });
@@ -249,17 +405,22 @@ exports.getStats = async (req, res) => {
     const statusMap = {};
     stats.forEach((s) => (statusMap[s._id] = s.count));
 
-    res.json({
-      success: true,
-      stats: {
-        total,
-        draft: statusMap.draft || 0,
-        applied: statusMap.applied || 0,
-        interviewing: statusMap.interviewing || 0,
-        offer: statusMap.offer || 0,
-        rejected: statusMap.rejected || 0,
-      },
-    });
+    const normalized = {
+      total,
+      pending: statusMap.pending || 0,
+      tailored: statusMap.tailored || 0,
+      ready: statusMap.ready || 0,
+      applied: statusMap.applied || 0,
+      viewed: statusMap.viewed || 0,
+      interviewing: statusMap.interviewing || 0,
+      offer: statusMap.offer || 0,
+      approved: statusMap.approved || 0,
+      rejected: statusMap.rejected || 0,
+      withdrawn: statusMap.withdrawn || 0,
+      draft: statusMap.pending || 0,
+    };
+
+    res.json({ success: true, stats: normalized });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }

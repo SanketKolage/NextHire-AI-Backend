@@ -14,21 +14,40 @@ const ApplicationSchema = new mongoose.Schema(
     },
 
     // Application details
+    // status: {
+    //   type: String,
+    //   enum: [
+    //     "draft",
+    //     "ready",
+    //     "applied",
+    //     "viewed",
+    //     "interviewing",
+    //     "offer",
+    //     "rejected",
+    //     "withdrawn",
+    //   ],
+    //   default: "draft",
+    // },
     status: {
       type: String,
       enum: [
-        "draft",
+        "new",
+        "pending",
+        "applying",
+        "tailored",
         "ready",
         "applied",
         "viewed",
         "interviewing",
         "offer",
+        "approved",
+        "failed",
+        "manual_action_required",
         "rejected",
         "withdrawn",
       ],
-      default: "draft",
+      default: "new",
     },
-
     // AI-generated cover letter
     coverLetter: {
       content: String,
@@ -42,7 +61,21 @@ const ApplicationSchema = new mongoose.Schema(
       keywordsToAdd: [String],
       generatedAt: Date,
     },
-
+    resumePdf:{
+      type:String
+    },
+    autoApplyEligible:{
+      type:Boolean,
+      default:false
+     },
+    tailoredResume: {
+      summary: String,
+      skills: [String],
+      experience: [Object],
+      projects: [Object],
+      atsScore: Number,
+      generatedAt: Date
+    },
     // Application method
     appliedVia: {
       type: String,
@@ -74,6 +107,7 @@ const ApplicationSchema = new mongoose.Schema(
     notes: String,
     priority: { type: String, enum: ["low", "medium", "high"], default: "medium" },
   },
+ 
   { timestamps: true }
 );
 

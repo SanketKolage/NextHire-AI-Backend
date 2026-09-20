@@ -2,6 +2,7 @@ const Job = require("../models/Job");
 const Resume = require("../models/Resume");
 const jobSearchService = require("../services/jobSearchService");
 const aiService = require("../services/aiService");
+const { upsertUniqueJobs } = require("../services/job/duplicateDetector.service");
 
 // ── POST /api/jobs/search ──────────────────────────────────────────────────────
 exports.searchJobs = async (req, res) => {
@@ -35,18 +36,12 @@ exports.searchJobs = async (req, res) => {
       page: page || 1,
     });
 
-    // Upsert jobs to DB (avoid duplicates by externalId)
-    const savedJobs = [];
-    for (const jobData of jobsRaw) {
-      let job = await Job.findOne({ externalId: jobData.externalId });
-      if (!job) {
-        job = new Job(jobData);
-      } else {
-        Object.assign(job, jobData);
-      }
-      await job.save();
-      savedJobs.push(job);
-    }
+    const savedJobs = await upsertUniqueJobs(jobsRaw.map((jobData) => ({
+      ...jobData,
+      externalId: jobData.externalId || jobData.sourceJobId,
+      sourceJobId: jobData.sourceJobId || jobData.externalId,
+      source: jobData.source || "jsearch",
+    })));
 
     // If resume provided, batch score all jobs
     if (resumeParsed && savedJobs.length > 0) {
@@ -60,6 +55,16 @@ exports.searchJobs = async (req, res) => {
             gaps: scoreResult.gaps,
             recommendation: scoreResult.recommendation,
             scoredAt: new Date(),
+            overallMatchScore: scoreResult.overallMatchScore,
+            skillMatchScore: scoreResult.skillMatchScore,
+            experienceMatchScore: scoreResult.experienceMatchScore,
+            locationMatchScore: scoreResult.locationMatchScore,
+            titleMatchScore: scoreResult.titleMatchScore,
+            educationMatchScore: scoreResult.educationMatchScore,
+            preferenceMatchScore: scoreResult.preferenceMatchScore,
+            matchedSkills: scoreResult.matchedSkills,
+            missingSkills: scoreResult.missingSkills,
+            explanation: scoreResult.explanation,
           },
         });
       }
@@ -99,6 +104,16 @@ exports.scoreJob = async (req, res) => {
       gaps: match.gaps,
       recommendation: match.recommendation,
       scoredAt: new Date(),
+      overallMatchScore: match.overallMatchScore,
+      skillMatchScore: match.skillMatchScore,
+      experienceMatchScore: match.experienceMatchScore,
+      locationMatchScore: match.locationMatchScore,
+      titleMatchScore: match.titleMatchScore,
+      educationMatchScore: match.educationMatchScore,
+      preferenceMatchScore: match.preferenceMatchScore,
+      matchedSkills: match.matchedSkills,
+      missingSkills: match.missingSkills,
+      explanation: match.explanation,
     };
     await job.save();
 
